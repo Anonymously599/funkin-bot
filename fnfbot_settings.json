@@ -1,0 +1,16 @@
+{
+  "keybinds": {
+    "0": "left",
+    "1": "down",
+    "2": "up",
+    "3": "right"
+  },
+  "hotkeys": {
+    "start_stop": "f1",
+    "offset_up": "f2",
+    "offset_down": "f3"
+  },
+  "offset": 25,
+  "global_hotkeys": true,
+  "fast_mode": true
+}
