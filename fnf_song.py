@@ -1,6 +1,7 @@
 """
 fnf_song.py  —  FNF Chart Parser
-Supports: Vanilla FNF .json, Psych Engine .json, .fnfc (zip), .zip chart packs
+Supports: Vanilla FNF .json, Psych Engine .json, P-Slice .json, .fnfc (zip),
+          .zip chart packs, and the newer FunkinCrew multi-difficulty .json format.
 """
 
 import json
@@ -8,6 +9,31 @@ import zipfile
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
+
+
+# ── Lane convention ─────────────────────────────────────────────────────
+#
+# Lane ownership depends on whether the chart has been through Psych
+# Engine's Song.hx convert() step, which is signaled by a top-level
+# "format": "psych_v1_convert" field:
+#
+#   CONVERTED  (format == "psych_v1_convert"):
+#       Ownership is ABSOLUTE — raw lane 0-3 is always the player, 4-7 is
+#       always the opponent. mustHitSection is not consulted. This also
+#       matches P-Slice's own generateSong():
+#           var gottaHitNote:Bool = (songNotes[1] < totalColumns); // totalColumns = 4
+#
+#   UNCONVERTED  (no "format" field, i.e. a raw/original Psych Engine
+#   chart straight out of the editor):
+#       Ownership follows Psych's own generateSong() SWAP rule instead:
+#           gottaHitNote = section.mustHitSection;
+#           if (songNotes[1] > 3) gottaHitNote = !section.mustHitSection;
+#       i.e. raw lanes 0-3 belong to whichever side mustHitSection points
+#       to, and raw lanes 4-7 belong to the OTHER side.
+#
+# Using the wrong rule for a given file silently swaps which notes are
+# treated as the player's — it does not raise an error, so this check
+# must run before ownership is decided for every note.
 
 
 # ── Note type classification ──────────────────────────────────────────
@@ -81,6 +107,9 @@ class FNFNote:
 @dataclass
 class FNFSection:
     notes:            List[FNFNote] = field(default_factory=list)
+    # Consulted for note-ownership decisions ONLY when the chart is
+    # unconverted (no "format": "psych_v1_convert" tag) — see the
+    # module docstring above for the two ownership rules.
     must_hit_section: bool          = True
 
 
@@ -153,22 +182,22 @@ def _si(val, default=0) -> int:
 class ChartParser:
 
     @staticmethod
-    def load(path: str) -> FNFSong:
+    def load(path: str, difficulty: Optional[str] = None) -> FNFSong:
         if not os.path.exists(path):
             raise FileNotFoundError("File not found: {}".format(path))
         ext = os.path.splitext(path)[1].lower()
         if ext in (".fnfc", ".zip"):
-            return ChartParser._load_zip(path)
+            return ChartParser._load_zip(path, difficulty)
         elif ext == ".json":
-            return ChartParser._load_json_file(path)
+            return ChartParser._load_json_file(path, difficulty)
         else:
             try:
-                return ChartParser._load_json_file(path)
+                return ChartParser._load_json_file(path, difficulty)
             except Exception:
                 raise ValueError("Unsupported file format: {}".format(ext))
 
     @staticmethod
-    def _load_zip(path: str) -> FNFSong:
+    def _load_zip(path: str, difficulty: Optional[str] = None) -> FNFSong:
         if not zipfile.is_zipfile(path):
             raise ValueError("'{}' is not a valid ZIP/FNFC archive.".format(
                 os.path.basename(path)))
@@ -206,7 +235,7 @@ class ChartParser:
                     data = json.loads(raw)
             except json.JSONDecodeError as e:
                 raise ValueError("Invalid JSON in '{}': {}".format(chart_file, e))
-        return ChartParser._parse(data, os.path.basename(path))
+        return ChartParser._parse(data, os.path.basename(path), difficulty)
 
     @staticmethod
     def _count_notes(data) -> int:
@@ -219,7 +248,7 @@ class ChartParser:
             return 0
 
     @staticmethod
-    def _load_json_file(path: str) -> FNFSong:
+    def _load_json_file(path: str, difficulty: Optional[str] = None) -> FNFSong:
         try:
             with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
                 raw = f.read().strip()
@@ -231,10 +260,10 @@ class ChartParser:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
             raise ValueError("Not valid JSON: {}".format(e))
-        return ChartParser._parse(data, os.path.basename(path))
+        return ChartParser._parse(data, os.path.basename(path), difficulty)
 
     @staticmethod
-    def _parse(data, filename: str) -> FNFSong:
+    def _parse(data, filename: str, difficulty: Optional[str] = None) -> FNFSong:
         if isinstance(data, str):
             try:   data = json.loads(data)
             except Exception:
@@ -246,6 +275,20 @@ class ChartParser:
         if isinstance(inner, dict):
             data = inner
 
+        notes_field = data.get("notes")
+
+        # NEW FORMAT: "notes" is a dict of {difficulty: [note, ...]}
+        if isinstance(notes_field, dict):
+            return ChartParser._parse_v2(data, filename, notes_field, difficulty)
+
+        # ── OLD FORMAT: "notes" is a list of sections ──────────────────
+        #
+        # Ownership rule is decided ONCE per file, from the top-level
+        # "format" field — see module docstring:
+        #   "psych_v1_convert" present → converted  → ABSOLUTE rule
+        #   field absent               → unconverted → SWAP rule
+        is_converted = data.get("format") == "psych_v1_convert"
+
         song           = FNFSong()
         raw_name       = data.get("song")
         song.song_name = str(raw_name) if raw_name else \
@@ -253,11 +296,10 @@ class ChartParser:
         song.bpm       = _sf(data.get("bpm"),   100.0) or 100.0
         song.speed     = _sf(data.get("speed"),   1.0) or 1.0
 
-        raw_sections = data.get("notes")
-        if not isinstance(raw_sections, list):
+        if not isinstance(notes_field, list):
             return song
 
-        for sd in raw_sections:
+        for sd in notes_field:
             if not isinstance(sd, dict):
                 continue
             sect     = FNFSection()
@@ -268,14 +310,86 @@ class ChartParser:
                 song.sections.append(sect)
                 continue
             for nd in raw_notes:
-                note = ChartParser._parse_note(nd, sect.must_hit_section)
+                note = ChartParser._parse_note(nd, sect.must_hit_section, is_converted)
                 if note is not None:
                     sect.notes.append(note)
             song.sections.append(sect)
         return song
 
     @staticmethod
-    def _parse_note(nd, must_hit: bool = True) -> Optional[FNFNote]:
+    def _parse_v2(data, filename: str, notes_by_diff: dict,
+                   difficulty: Optional[str] = None) -> FNFSong:
+        """
+        Newer chart format (FunkinCrew engine, v2.x): all difficulties share
+        one file. Each note is {"t": ms, "d": 0-7, "l": hold_ms, "k": kind}.
+        This format is always post-conversion, so ownership is always
+        ABSOLUTE: d < 4 is the PLAYER, d >= 4 is the OPPONENT (lane = d % 4).
+        """
+        available = [k for k, v in notes_by_diff.items() if isinstance(v, list)]
+
+        if difficulty and difficulty in notes_by_diff:
+            chosen = difficulty
+        elif "normal" in notes_by_diff:
+            chosen = "normal"
+        elif available:
+            chosen = available[0]
+        else:
+            chosen = None
+
+        song = FNFSong()
+        song.song_name = filename.replace(".json", "").replace(".fnfc", "")
+        song.bpm       = _sf(data.get("bpm"), 100.0) or 100.0
+
+        speeds = data.get("scrollSpeed")
+        song.speed = _sf(speeds.get(chosen), 1.0) if isinstance(speeds, dict) and chosen in speeds else 1.0
+
+        section = FNFSection(must_hit_section=True)
+        raw_notes = notes_by_diff.get(chosen, []) if chosen else []
+
+        for nd in raw_notes:
+            if not isinstance(nd, dict):
+                continue
+            t    = _sf(nd.get("t"))
+            d    = _si(nd.get("d"))
+            hold = _sf(nd.get("l"), 0.0)
+            kind = nd.get("k") or ""
+
+            if t < 0 or d < 0 or d >= 8:
+                continue
+            if d >= 4:
+                continue   # opponent note — discard
+
+            section.notes.append(FNFNote(
+                time=t,
+                lane=d % 4,
+                hold_length=max(0.0, hold),
+                raw_lane=d,
+                note_type=str(kind).strip(),
+            ))
+
+        song.sections.append(section)
+        return song
+
+    @staticmethod
+    def list_difficulties(path: str) -> List[str]:
+        """Returns difficulty names if this is the new multi-difficulty
+        format, or [] for the old format (nothing to choose)."""
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                data = json.loads(f.read())
+            if isinstance(data, dict):
+                inner = data.get("song")
+                if isinstance(inner, dict):
+                    data = inner
+                notes_field = data.get("notes")
+                if isinstance(notes_field, dict):
+                    return [k for k, v in notes_field.items() if isinstance(v, list)]
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _parse_note(nd, must_hit_section: bool, is_converted: bool) -> Optional[FNFNote]:
         if not isinstance(nd, (list, tuple)) or len(nd) < 2:
             return None
         try:
@@ -292,12 +406,23 @@ class ChartParser:
             return None
 
         # ── OPPONENT NOTE DETECTION ───────────────────────────────────
-        # Standard lane logic: mustHit=True  → lanes 0-3 player, 4-7 opponent
-        #                       mustHit=False → lanes 4-7 player, 0-3 opponent
-        lane      = rl % 4
-        is_player = (rl < 4) if must_hit else (rl >= 4)
+        # See module docstring for the two rules. Which one applies is
+        # decided once per file (is_converted), not per note.
+        lane = rl % 4
+        if is_converted:
+            # CONVERTED chart ("psych_v1_convert"): ownership is absolute.
+            is_player = rl < 4
+        else:
+            # UNCONVERTED chart (no "format" tag): swap rule.
+            #   raw lane 0-3 → owned by whichever side mustHitSection points to
+            #   raw lane 4-7 → owned by the OTHER side
+            if rl < 4:
+                is_player = must_hit_section
+            else:
+                is_player = not must_hit_section
+
         if not is_player:
-            return None   # opponent lane — discard entirely
+            return None   # opponent note — discard entirely
 
         # ── OPPONENT-TAGGED NOTE ──────────────────────────────────────
         # Some mods (e.g. Double Trouble) put notes in player lanes but tag
@@ -313,3 +438,4 @@ class ChartParser:
             raw_lane=rl,
             note_type=note_type,
         )
+        
