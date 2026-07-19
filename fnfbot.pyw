@@ -22,6 +22,14 @@ Bugs fixed vs previous version:
  18. Bot started while previous bot still winding down — stop old bot first
  19. Unicode chars in title bar crash some Windows terminal encodings — safe fallback
  20. Window closes while bot is playing, holding keys forever — WM_DELETE_WINDOW handler
+ 21. Custom per-type note overrides — per-note-type checkboxes (built
+     after chart load) let you force-click or force-skip a specific
+     note type, overriding the global harmful-skip default
+ 22. Multi-difficulty chart support — charts with more than one
+     difficulty now prompt a selection dialog before loading
+ 23. Note lane ownership fixed to absolute rule (lanes 0-3 = player,
+     4-7 = opponent) — old mustHitSection-swap logic mis-pressed
+     opponent notes on both Psych Engine and P-Slice charts
 """
 
 import tkinter as tk
@@ -86,6 +94,7 @@ _DEFAULTS = {
     "global_hotkeys": True,
     "fast_mode":      False,
     "skip_harmful":   True,   # skip Mine/MissNote/Void/Hurt notes (recommended)
+    "custom_notes":   {},     # note_type_str -> bool (True = bot clicks it, overrides class)
 }
 
 def _deep_merge(base, override):
@@ -231,7 +240,8 @@ class FNFBotApp(tk.Tk):
         super().__init__()
         self.title("FNFBot  \u2014  Python Edition")
         self.configure(bg=BG)
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self.minsize(900, 600)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Suppress console window on Windows
@@ -252,11 +262,12 @@ class FNFBotApp(tk.Tk):
         self._last_tick_ui = 0.0
 
         # Tk vars — must exist before _build_ui()
-        self._offset_var     = tk.StringVar(value=str(self._settings.get("offset", 25)))
-        self._key_vars       = {}   # int lane -> StringVar
-        self._hk_vars        = {}   # str action -> StringVar
-        self._global_hk      = tk.BooleanVar(value=bool(self._settings.get("global_hotkeys", True)))
-        self._skip_harmful_v = tk.BooleanVar(value=bool(self._settings.get("skip_harmful", True)))
+        self._offset_var       = tk.StringVar(value=str(self._settings.get("offset", 25)))
+        self._key_vars         = {}   # int lane -> StringVar
+        self._hk_vars          = {}   # str action -> StringVar
+        self._global_hk        = tk.BooleanVar(value=bool(self._settings.get("global_hotkeys", True)))
+        self._skip_harmful_v   = tk.BooleanVar(value=bool(self._settings.get("skip_harmful", True)))
+        self._custom_note_vars = {}   # note_type_str -> BooleanVar (built after chart load)
 
         self._build_ui()
 
@@ -573,7 +584,8 @@ class FNFBotApp(tk.Tk):
                       "  Opponent (Opponent 2 Sing, etc.)                — belong to a 2nd opponent\n"
                       "  Cosmetic (Alt Animation, Trail Note, No Sing)   — safe, click normally\n\n"
                       "Opponent notes are ALWAYS skipped.\n"
-                      "Toggle below controls harmful notes only.",
+                      "Toggle below controls harmful notes only (global default).\n"
+                      "Per-type checkboxes below (after loading a chart) override this per note type.",
                  bg=SETS_BG, fg=DIM, font=F_TINY, justify="left").pack(anchor="w", **p)
 
         chk_row2 = tk.Frame(inner, bg=SETS_BG)
@@ -590,6 +602,9 @@ class FNFBotApp(tk.Tk):
                  text="Load a chart to see its note types.",
                  bg=SETS_BG, fg=DIM, font=F_TINY, justify="left", wraplength=660)
         self._note_types_lbl.pack(anchor="w", **p)
+
+        self._custom_notes_frame = tk.Frame(inner, bg=SETS_BG)
+        self._custom_notes_frame.pack(anchor="w", fill="x", **p)
 
         self._settings_sep(inner)
 
@@ -626,6 +641,36 @@ class FNFBotApp(tk.Tk):
                  relief="flat", bd=4).pack(side="left", padx=4)
         tk.Label(r, text=hint, bg=SETS_BG, fg=DIM, font=F_TINY).pack(side="left", padx=4)
 
+    def _rebuild_custom_note_checks(self, found_types):
+        """(Re)build one checkbox per note type found in the loaded chart.
+        Default state: checked unless the type classifies as harmful/opponent,
+        or unless the user already saved an explicit choice for this type."""
+        for w in self._custom_notes_frame.winfo_children():
+            w.destroy()
+        self._custom_note_vars.clear()
+
+        if not found_types:
+            return
+
+        from fnf_song import classify_note_type
+        saved = self._settings.get("custom_notes", {})
+
+        tk.Label(self._custom_notes_frame,
+                 text="Per-type overrides (checked = bot WILL click it, even if harmful):",
+                 bg=SETS_BG, fg=TEXT, font=F_TINY, justify="left").pack(anchor="w", pady=(6, 2))
+
+        for nt in found_types:
+            cls = classify_note_type(nt)
+            default = saved.get(nt, cls not in ("harmful", "opponent"))
+            v = tk.BooleanVar(value=bool(default))
+            self._custom_note_vars[nt] = v
+            row = tk.Frame(self._custom_notes_frame, bg=SETS_BG)
+            row.pack(anchor="w", fill="x", pady=1)
+            tk.Checkbutton(row, text="{}   [{}]".format(nt, cls),
+                           variable=v, bg=SETS_BG, fg=TEXT, selectcolor="#1a1a2a",
+                           activebackground=SETS_BG, activeforeground=TEXT,
+                           font=F_TINY).pack(side="left")
+
     # ── Settings actions ──────────────────────────────────────────────
     def _on_global_hk_toggle(self):
         enabled = self._global_hk.get()
@@ -656,12 +701,20 @@ class FNFBotApp(tk.Tk):
         except (ValueError, TypeError):
             offset = 25
 
+        # ── FIX: persist per-note-type checkbox states ─────────────────
+        # This was previously only happening inside _on_global_hk_toggle,
+        # which never fires when you press "Save Settings". Merge current
+        # checkbox states into the saved custom_notes dict here instead.
+        merged_custom = dict(self._settings.get("custom_notes", {}))
+        merged_custom.update({nt: v.get() for nt, v in self._custom_note_vars.items()})
+
         self._settings["keybinds"]       = kb
         self._settings["hotkeys"]        = hk
         self._settings["offset"]         = offset
         self._settings["global_hotkeys"] = self._global_hk.get()
         self._settings["fast_mode"]      = self._fast_mode_var.get()
         self._settings["skip_harmful"]   = self._skip_harmful_v.get()
+        self._settings["custom_notes"]   = merged_custom
 
         save_settings(self._settings)
 
@@ -718,17 +771,68 @@ class FNFBotApp(tk.Tk):
         if path:
             self._load_chart(path)
 
+    def _ask_difficulty(self, options):
+        """Modal popup to pick a difficulty. Returns the chosen name, or None if cancelled."""
+        result = {"choice": None}
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Select Difficulty")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="This chart has multiple difficulties.\nWhich one should the bot play?",
+                 bg=BG, fg=TEXT, font=F_MAIN, justify="left").pack(padx=20, pady=(16, 10))
+
+        def choose(name):
+            result["choice"] = name
+            dlg.destroy()
+
+        for name in options:
+            tk.Button(dlg, text=name.upper(), command=lambda n=name: choose(n),
+                      bg=ACCENT, fg="white", font=F_BOLD,
+                      relief="flat", cursor="hand2", pady=8
+                      ).pack(padx=20, pady=4, fill="x")
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - 120
+        y = self.winfo_y() + (self.winfo_height() // 2) - 80
+        dlg.geometry("+{}+{}".format(max(x, 0), max(y, 0)))
+
+        self.wait_window(dlg)
+        return result["choice"]
+
     def _load_chart(self, path):
         if not DEPS_OK:
             self._log("[ERROR] Core modules missing. Run install.bat.", "err")
             return
+
+        # Multi-difficulty charts need the popup on the main thread, BEFORE
+        # the background load thread starts (Tk dialogs only work here).
+        try:
+            options = ChartParser.list_difficulties(path)
+        except Exception:
+            options = []
+
+        difficulty = None
+        if options:
+            if len(options) == 1:
+                difficulty = options[0]
+            else:
+                difficulty = self._ask_difficulty(options)
+                if difficulty is None:
+                    self._log("Chart load cancelled.", "warn")
+                    self._status.set("Ready \u2014 Load a chart to begin")
+                    return
 
         self._status.set("Loading chart... Please wait...")
         self._log("Loading chart...", "info")
 
         def do_load():
             try:
-                song         = ChartParser.load(path)
+                song         = ChartParser.load(path, difficulty=difficulty)
                 skip_harmful = self._skip_harmful_v.get()
                 notes        = song.playable_notes(skip_harmful=skip_harmful)
                 all_notes    = song.all_player_notes()
@@ -751,16 +855,22 @@ class FNFBotApp(tk.Tk):
 
                     # Build note types summary for settings tab label
                     if ft:
+                        custom_now = self._settings.get("custom_notes", {})
                         lines_t = ["Found note types:"]
                         for nt in ft:
                             from fnf_song import classify_note_type
                             cls = classify_note_type(nt)
-                            action = {
-                                "harmful":  "SKIPPED (harmful)" if skip_harmful else "clicked (skip OFF)",
-                                "opponent": "SKIPPED (opponent)",
-                                "cosmetic": "clicked (cosmetic)",
-                                "normal":   "clicked",
-                            }.get(cls, "clicked")
+                            override = custom_now.get(nt, None)
+                            if cls == "opponent":
+                                action = "SKIPPED (opponent)"
+                            elif override is not None:
+                                action = "clicked (custom override ON)" if override else "SKIPPED (custom override OFF)"
+                            elif cls == "harmful":
+                                action = "SKIPPED (harmful)" if skip_harmful else "clicked (skip OFF)"
+                            elif cls == "cosmetic":
+                                action = "clicked (cosmetic)"
+                            else:
+                                action = "clicked"
                             lines_t.append("  {}  ->  {}".format(nt, action))
                         if so:
                             lines_t.append("Opponent-tagged notes skipped: {}".format(so))
@@ -774,6 +884,8 @@ class FNFBotApp(tk.Tk):
                         self._note_types_lbl.config(text=type_text)
                     except Exception:
                         pass
+
+                    self._rebuild_custom_note_checks(ft)
 
                     self._log("Loaded: {}  ({} notes, {} skipped)".format(
                         song.song_name, len(n), so + (sh if skip_harmful else 0)))
@@ -801,6 +913,17 @@ class FNFBotApp(tk.Tk):
             self._status.set("Stopped.")
         else:
             self._start_bot()
+            
+    def _classify_keep(self, n, skip_harmful, custom):
+        """Returns (keep: bool, reason: str) for a note under current filters."""
+        if n.type_class == "opponent":
+            return False, "opponent"
+        override = custom.get(n.note_type or "", None)
+        if override is not None:
+            return override, "custom"
+        if n.type_class == "harmful":
+            return (not skip_harmful), "harmful"
+        return True, "normal"
 
     def _start_bot(self):
         if not self._song:
@@ -810,9 +933,22 @@ class FNFBotApp(tk.Tk):
             self._log("[ERROR] Missing modules. Run install.bat.", "err")
             return
 
-        # Use playable_notes() — respects skip_harmful toggle and always skips opponent notes
         skip_harmful = self._skip_harmful_v.get()
-        notes = self._song.playable_notes(skip_harmful=skip_harmful)
+        custom       = self._settings.get("custom_notes", {})
+        all_notes    = self._song.all_player_notes()
+
+        notes = []
+        skip_counts = {"opponent": 0, "harmful": 0, "custom": 0}
+        for n in all_notes:
+            keep, reason = self._classify_keep(n, skip_harmful, custom)
+            if keep:
+                notes.append(n)
+            elif reason in skip_counts:
+                skip_counts[reason] += 1
+
+        if skip_counts["custom"]:
+            self._log("Custom overrides skipped {} note(s).".format(skip_counts["custom"]), "warn")
+            
         if not notes:
             self._log("No playable notes found in chart! Cannot start bot.", "err")
             self._status.set("Error: Chart has no playable notes!")
