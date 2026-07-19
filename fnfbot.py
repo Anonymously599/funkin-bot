@@ -22,11 +22,9 @@ Bugs fixed vs previous version:
  18. Bot started while previous bot still winding down — stop old bot first
  19. Unicode chars in title bar crash some Windows terminal encodings — safe fallback
  20. Window closes while bot is playing, holding keys forever — WM_DELETE_WINDOW handler
- 21. Note lane ownership: confirmed by direct testing that the classic
-     mustHitSection-swap rule mis-presses opponent notes on BOTH Psych
-     Engine and P-Slice charts. Replaced it everywhere with a single
-     absolute rule (lane 0-3 = player, 4-7 = opponent, unconditionally) —
-     no per-chart engine choice needed anymore.
+ 21. Note lane ownership fixed to absolute rule (lanes 0-3 = player,
+     4-7 = opponent) — old mustHitSection-swap logic mis-pressed
+     opponent notes on both Psych Engine and P-Slice charts
 """
 
 import tkinter as tk

@@ -13,12 +13,26 @@ Key fixes vs previous version:
   8. get_backend_name() never throws
   9. start_global_hotkeys() is safe to call repeatedly — only one hook lives at a time
  10. Linux/macOS: pynput fallback works without ctypes
+ 11. Win32 hook now declares explicit argtypes/restype — fixes
+     intermittent SetWindowsHookExW crash that silently fell back to pynput
+ 12. Win32 hook now passes hMod=0 (not GetModuleHandleW) — WH_KEYBOARD_LL
+     is always thread-local, never injected; a real module handle caused
+     WinError 126 "module not found" on every attempt the app was run
+ 13. kernel32 handle removed — it was only used for the now-deleted
+     GetModuleHandleW call
+ 14. Added is_frozen() check — .py runs now log the real WinError code/
+     message for debugging, .exe builds show the simpler message for end users
 """
 
 import threading
 import time
 import sys
 from typing import Callable, Optional
+
+# ── Frozen/exe detection ───────────────────────────────────────────────
+def is_frozen() -> bool:
+    """True when running as a PyInstaller-built exe, False when running as .py"""
+    return getattr(sys, 'frozen', False)
 
 # ── Key backend detection ─────────────────────────────────────────────
 _backend: Optional[str] = None
@@ -215,8 +229,22 @@ def _win32_hook(log: Optional[Callable]) -> None:
         HOOKPROC = ctypes.WINFUNCTYPE(
             ctypes.c_long, ctypes.c_int, wt.WPARAM, wt.LPARAM)
 
-        user32   = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
+        user32   = ctypes.WinDLL('user32', use_last_error=True)
+
+        # Explicit prototypes — required so ctypes marshals the HOOKPROC
+        # callback correctly. Without these, SetWindowsHookExW intermittently
+        # throws "expected WinFunctionType instance instead of WinFunctionType".
+        user32.SetWindowsHookExW.restype  = wt.HHOOK
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wt.HINSTANCE, wt.DWORD]
+
+        user32.CallNextHookEx.restype  = ctypes.c_long
+        user32.CallNextHookEx.argtypes = [wt.HHOOK, ctypes.c_int, wt.WPARAM, wt.LPARAM]
+
+        user32.UnhookWindowsHookEx.restype  = wt.BOOL
+        user32.UnhookWindowsHookEx.argtypes = [wt.HHOOK]
+
+        user32.GetMessageW.restype  = wt.BOOL
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, ctypes.c_uint, ctypes.c_uint]
 
         def low_level_handler(nCode, wParam, lParam):
             if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
@@ -229,13 +257,17 @@ def _win32_hook(log: Optional[Callable]) -> None:
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
         proc   = HOOKPROC(low_level_handler)
-        hmod   = kernel32.GetModuleHandleW(None)
-        handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, proc, hmod, 0)
+        handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, proc, 0, 0)
 
         if not handle:
+            err = ctypes.get_last_error()
             if log:
-                log("[WARN] Win32 keyboard hook failed (try Run as Administrator). "
-                    "Falling back to pynput.")
+                if is_frozen():
+                    log("[WARN] Win32 keyboard hook failed (try Run as Administrator). "
+                        "Falling back to pynput.")
+                else:
+                    log("[WARN] Win32 keyboard hook failed (WinError {}: {}). Falling back to pynput.".format(
+                        err, ctypes.FormatError(err)))
             _hook_started.clear()
             _pynput_hook(log)
             return
