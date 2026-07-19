@@ -22,7 +22,12 @@ Bugs fixed vs previous version:
  18. Bot started while previous bot still winding down — stop old bot first
  19. Unicode chars in title bar crash some Windows terminal encodings — safe fallback
  20. Window closes while bot is playing, holding keys forever — WM_DELETE_WINDOW handler
- 21. Note lane ownership fixed to absolute rule (lanes 0-3 = player,
+ 21. Custom per-type note overrides — per-note-type checkboxes (built
+     after chart load) let you force-click or force-skip a specific
+     note type, overriding the global harmful-skip default
+ 22. Multi-difficulty chart support — charts with more than one
+     difficulty now prompt a selection dialog before loading
+ 23. Note lane ownership fixed to absolute rule (lanes 0-3 = player,
      4-7 = opponent) — old mustHitSection-swap logic mis-pressed
      opponent notes on both Psych Engine and P-Slice charts
 """
@@ -472,18 +477,6 @@ class FNFBotApp(tk.Tk):
 
         p = {"padx": 20, "pady": 3}
 
-        # ── Note reading info ────────────────────────────────────────
-        self._settings_section(inner, "NOTE READING")
-        tk.Label(inner,
-                 text="Lane ownership is read with one universal rule: lane 0-3 is\n"
-                      "always the player, 4-7 is always the opponent. mustHitSection\n"
-                      "is ignored for this. Confirmed by testing to be correct for both\n"
-                      "P-Slice and real Psych Engine chart files \u2014 no per-chart choice\n"
-                      "needed.",
-                 bg=SETS_BG, fg=DIM, font=F_TINY, justify="left").pack(anchor="w", **p)
-
-        self._settings_sep(inner)
-
         # ── Global hotkeys toggle ─────────────────────────────────────
         self._settings_section(inner, "GLOBAL HOTKEYS")
         tk.Label(inner,
@@ -862,16 +855,22 @@ class FNFBotApp(tk.Tk):
 
                     # Build note types summary for settings tab label
                     if ft:
+                        custom_now = self._settings.get("custom_notes", {})
                         lines_t = ["Found note types:"]
                         for nt in ft:
                             from fnf_song import classify_note_type
                             cls = classify_note_type(nt)
-                            action = {
-                                "harmful":  "SKIPPED (harmful)" if skip_harmful else "clicked (skip OFF)",
-                                "opponent": "SKIPPED (opponent)",
-                                "cosmetic": "clicked (cosmetic)",
-                                "normal":   "clicked",
-                            }.get(cls, "clicked")
+                            override = custom_now.get(nt, None)
+                            if cls == "opponent":
+                                action = "SKIPPED (opponent)"
+                            elif override is not None:
+                                action = "clicked (custom override ON)" if override else "SKIPPED (custom override OFF)"
+                            elif cls == "harmful":
+                                action = "SKIPPED (harmful)" if skip_harmful else "clicked (skip OFF)"
+                            elif cls == "cosmetic":
+                                action = "clicked (cosmetic)"
+                            else:
+                                action = "clicked"
                             lines_t.append("  {}  ->  {}".format(nt, action))
                         if so:
                             lines_t.append("Opponent-tagged notes skipped: {}".format(so))
@@ -914,6 +913,17 @@ class FNFBotApp(tk.Tk):
             self._status.set("Stopped.")
         else:
             self._start_bot()
+            
+    def _classify_keep(self, n, skip_harmful, custom):
+        """Returns (keep: bool, reason: str) for a note under current filters."""
+        if n.type_class == "opponent":
+            return False, "opponent"
+        override = custom.get(n.note_type or "", None)
+        if override is not None:
+            return override, "custom"
+        if n.type_class == "harmful":
+            return (not skip_harmful), "harmful"
+        return True, "normal"
 
     def _start_bot(self):
         if not self._song:
@@ -923,29 +933,22 @@ class FNFBotApp(tk.Tk):
             self._log("[ERROR] Missing modules. Run install.bat.", "err")
             return
 
-        # ── FIX: start from ALL player notes and apply both filters ourselves.
-        # playable_notes() already strips harmful/opponent notes BEFORE a
-        # custom per-type override could ever re-enable one — so a checkbox
-        # that force-enables e.g. "Hurt Note" had no notes left to act on.
-        # Building the filter here means an explicit per-type choice always
-        # wins, and anything untouched falls back to the global skip_harmful
-        # toggle. Opponent notes are still always skipped, no override.
         skip_harmful = self._skip_harmful_v.get()
         custom       = self._settings.get("custom_notes", {})
         all_notes    = self._song.all_player_notes()
 
-        def _keep(n):
-            if n.type_class == "opponent":
-                return False
-            override = custom.get(n.note_type or "", None)
-            if override is not None:
-                return override
-            if n.type_class == "harmful":
-                return not skip_harmful
-            return True
+        notes = []
+        skip_counts = {"opponent": 0, "harmful": 0, "custom": 0}
+        for n in all_notes:
+            keep, reason = self._classify_keep(n, skip_harmful, custom)
+            if keep:
+                notes.append(n)
+            elif reason in skip_counts:
+                skip_counts[reason] += 1
 
-        notes = [n for n in all_notes if _keep(n)]
-
+        if skip_counts["custom"]:
+            self._log("Custom overrides skipped {} note(s).".format(skip_counts["custom"]), "warn")
+            
         if not notes:
             self._log("No playable notes found in chart! Cannot start bot.", "err")
             self._status.set("Error: Chart has no playable notes!")
